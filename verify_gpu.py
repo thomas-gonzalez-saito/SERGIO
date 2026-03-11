@@ -21,7 +21,7 @@ BASE_INPUT_REGS_FILE = '../SERGIO/data_sets/De-noised_1200G_9T_300cPerT_6_DS3/Re
 SIM_PARAMS = {
     'number_genes': 1200,
     'number_bins': 9,
-    'number_sc': 1,         # Reduced from 300 to 5 purely for quick verification
+    'number_sc': 300,         # Reduced from 300 to 5 purely for quick verification
     'noise_params': 1,
     'decays': 0.8,
     'sampling_state': 15,   # Actual sampling state

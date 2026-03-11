@@ -61,7 +61,11 @@ class sergio_gpu:
         splice_ratio=4,
         dt_splice=0.01,
         migration_rate=None,
+        device_id=0,
     ):
+        if _HAS_GPU:
+            xp.cuda.Device(device_id).use()
+        
         self.nGenes_ = number_genes
         self.nBins_ = number_bins
         self.nSC_ = number_sc
@@ -388,63 +392,69 @@ class sergio_gpu:
                         # done.  So we use meanExpression here.
                         nonlocal_reg_conc[ti, ri, :] = self.meanExpression[rId, :]
 
+        # ---- Pre-compute Master Regulator Rates ----------------------------
+        if len(mr_mask) > 0:
+            mr_rates = np.zeros((len(mr_mask), nBins), dtype=np.float64)
+            for i, local_idx in enumerate(mr_mask):
+                gid = geneIDs[local_idx]
+                mr_rates[i, :] = self.graph_[gid]['rates']
+            mr_rates_d = xp.asarray(mr_rates)
+
+        # ---- Prepare Advanced Indexing for Targets -------------------------
+        if nTargets > 0 and max_regs > 0:
+            safe_reg_local_idx_d = xp.maximum(reg_local_idx_d, 0)
+            reg_is_local_expanded = reg_is_local_d[:, :, None]
+
+        # ---- Pre-generate all random noise to save CUDA launch overhead -----
+        if self.noiseType_ in ['sp', 'spd']:
+            dw_all = xp.random.normal(size=(nReqSteps, nGenes_layer, nBins))
+        elif self.noiseType_ == 'dpd':
+            dw_p_all = xp.random.normal(size=(nReqSteps, nGenes_layer, nBins))
+            dw_d_all = xp.random.normal(size=(nReqSteps, nGenes_layer, nBins))
+
+        # ---- Pre-allocate production rate array ----------------------------
+        prod_rate = xp.zeros((nGenes_layer, nBins), dtype=xp.float64)
+
         # ---- Time-stepping loop -------------------------------------------
         print(f"  Simulating {nGenes_layer} genes × {nBins} bins for {nReqSteps} steps …")
         for step in range(1, nReqSteps):
             curr_conc = conc_history[step - 1]  # (nGenes_layer, nBins)
 
             # ---------- Production rate: (nGenes_layer, nBins) ---------------
-            prod_rate = xp.zeros_like(curr_conc)
-
+            
             # Master regulators: constant production rate
-            for local_idx in mr_mask:
-                gid = geneIDs[local_idx]
-                prod_rate[local_idx, :] = xp.asarray(self.graph_[gid]['rates'], dtype=xp.float64)
+            if len(mr_mask) > 0:
+                prod_rate[mr_mask, :] = mr_rates_d
 
-            # Target genes: vectorised Hill + matmul
+            # Target genes: vectorised Hill + weighted sum
             if nTargets > 0 and max_regs > 0:
-                # Gather regulator concentrations: (nTargets, max_regs, nBins)
-                reg_conc = xp.zeros((nTargets, max_regs, nBins), dtype=xp.float64)
+                # Advanced indexing: fetch all local regulator concentrations at once
+                local_vals = curr_conc[safe_reg_local_idx_d] # (nTargets, max_regs, nBins)
+                
+                # Mask between local and non-local
+                reg_conc = xp.where(reg_is_local_expanded, local_vals, nonlocal_reg_conc)
 
-                # Local regulators – fancy-index into curr_conc
-                # Build flat indices for local regulators
-                for ti in range(nTargets):
-                    nr = int(n_regs_per_gene[ti])
-                    for ri in range(nr):
-                        if reg_is_local[ti, ri]:
-                            li = reg_local_idx[ti, ri]
-                            reg_conc[ti, ri, :] = curr_conc[li, :]
-                        else:
-                            reg_conc[ti, ri, :] = nonlocal_reg_conc[ti, ri, :]
-
-                # Vectorised Hill function: (nTargets, max_regs, nBins)
+                # Vectorised Hill function
                 hill_vals = self._hill_vectorised(
                     reg_conc, h_resp_d[:, :, None], coop_d[:, :, None],
                     is_repressive_d[:, :, None]
                 )
-                # Zero out padded slots
                 hill_vals = hill_vals * reg_mask_d[:, :, None]
 
-                # Weighted sum: for each target gene, sum K_abs[ti,ri] * hill[ti,ri,bin]
-                # prod[ti, bin] = sum_ri  K[ti,ri] * hill[ti,ri,bin]
-                # = einsum('tr,trb->tb', K_abs, hill_vals)
-                target_prod = xp.einsum('tr,trb->tb', K_abs_d, hill_vals)
-
-                # Write into prod_rate at the target positions
-                for ti, local_idx in enumerate(target_mask):
-                    prod_rate[local_idx, :] = target_prod[ti, :]
+                # Weighted sum and direct assignment into prod_rate
+                prod_rate[target_mask, :] = xp.einsum('tr,trb->tb', K_abs_d, hill_vals)
 
             # ---------- Decay: (nGenes_layer, nBins) -------------------------
             decay = local_decay_2d * curr_conc
 
             # ---------- Noise: (nGenes_layer, nBins) -------------------------
             if self.noiseType_ == 'sp':
-                dw = xp.random.normal(size=(nGenes_layer, nBins))
+                dw = dw_all[step]
                 amplitude = local_noise_2d * xp.sqrt(xp.maximum(prod_rate, 0.0))
                 noise = amplitude * dw
 
             elif self.noiseType_ == 'spd':
-                dw = xp.random.normal(size=(nGenes_layer, nBins))
+                dw = dw_all[step]
                 amplitude = local_noise_2d * (
                     xp.sqrt(xp.maximum(prod_rate, 0.0)) +
                     xp.sqrt(xp.maximum(decay, 0.0))
@@ -452,20 +462,18 @@ class sergio_gpu:
                 noise = amplitude * dw
 
             elif self.noiseType_ == 'dpd':
-                dw_p = xp.random.normal(size=(nGenes_layer, nBins))
-                dw_d = xp.random.normal(size=(nGenes_layer, nBins))
+                dw_p = dw_p_all[step]
+                dw_d = dw_d_all[step]
                 amp_p = local_noise_2d * xp.sqrt(xp.maximum(prod_rate, 0.0))
                 amp_d = local_noise_2d * xp.sqrt(xp.maximum(decay, 0.0))
                 noise = amp_p * dw_p + amp_d * dw_d
             else:
-                noise = xp.zeros_like(curr_conc)
+                noise = 0.0
 
             # ---------- Euler-Maruyama step ----------------------------------
             new_conc = curr_conc + dt * (prod_rate - decay) + sqrt_dt * noise
-            # Clamp to non-negative
-            xp.maximum(new_conc, 0.0, out=new_conc)
-
-            conc_history[step] = new_conc
+            # Clamp to non-negative and store
+            xp.maximum(new_conc, 0.0, out=conc_history[step])
 
         # ---- Sample single-cell expressions --------------------------------
         # scIndices_ contains negative indices into the *end* of the trajectory
@@ -531,39 +539,40 @@ class sergio_gpu:
         for gid in range(self.nGenes_):
             if gid in self.scExpressions_:
                 ret[:, gid, :] = self.scExpressions_[gid]
-        return _to_numpy(ret)
+        return ret
 
     # -------------------------------------------------------------- technical noise
 
     def outlier_effect(self, scData, outlier_prob, mean, scale):
-        out_indicator = np.random.binomial(n=1, p=outlier_prob, size=self.nGenes_)
-        outlierGenesIndx = np.where(out_indicator == 1)[0]
+        out_indicator = xp.random.binomial(n=1, p=outlier_prob, size=self.nGenes_)
+        outlierGenesIndx = xp.where(out_indicator == 1)[0]
         numOutliers = len(outlierGenesIndx)
-        outFactors = np.random.lognormal(mean=mean, sigma=scale, size=numOutliers)
+        outFactors = xp.random.lognormal(mean=mean, sigma=scale, size=numOutliers)
 
-        scData = np.concatenate(scData, axis=1)
+        scData = xp.concatenate(scData, axis=1)
         for i, gIndx in enumerate(outlierGenesIndx):
             scData[gIndx, :] = scData[gIndx, :] * outFactors[i]
-        return np.split(scData, self.nBins_, axis=1)
+        return xp.split(scData, self.nBins_, axis=1)
 
     def lib_size_effect(self, scData, mean, scale):
         ret_data = []
-        libFactors = np.random.lognormal(mean=mean, sigma=scale, size=(self.nBins_, self.nSC_))
+        libFactors = xp.random.lognormal(mean=mean, sigma=scale, size=(self.nBins_, self.nSC_))
         for binExprMatrix, binFactors in zip(scData, libFactors):
-            normalizFactors = np.sum(binExprMatrix, axis=0)
-            binFactors = np.true_divide(binFactors, normalizFactors)
+            normalizFactors = xp.sum(binExprMatrix, axis=0)
+            binFactors = xp.true_divide(binFactors, normalizFactors)
             binFactors = binFactors.reshape(1, self.nSC_)
-            binFactors = np.repeat(binFactors, self.nGenes_, axis=0)
-            ret_data.append(np.multiply(binExprMatrix, binFactors))
-        return libFactors, np.array(ret_data)
+            binFactors = xp.repeat(binFactors, self.nGenes_, axis=0)
+            ret_data.append(xp.multiply(binExprMatrix, binFactors))
+        return libFactors, xp.array(ret_data)
 
     def dropout_indicator(self, scData, shape=1, percentile=65):
-        scData = np.array(scData)
-        scData_log = np.log(np.add(scData, 1))
-        log_mid_point = np.percentile(scData_log, percentile)
-        prob_ber = np.true_divide(1, 1 + np.exp(-1 * shape * (scData_log - log_mid_point)))
-        binary_ind = np.random.binomial(n=1, p=prob_ber)
+        scData = xp.array(scData)
+        scData_log = xp.log(xp.add(scData, 1))
+        log_mid_point = xp.percentile(scData_log, percentile)
+        prob_ber = xp.true_divide(1, 1 + xp.exp(-1 * shape * (scData_log - log_mid_point)))
+        binary_ind = xp.random.binomial(n=1, p=prob_ber)
         return binary_ind
 
     def convert_to_UMIcounts(self, scData):
-        return np.random.poisson(scData)
+        # Always return numpy matrix at the very end of the pipeline
+        return _to_numpy(xp.random.poisson(scData))

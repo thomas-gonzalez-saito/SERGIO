@@ -25,7 +25,8 @@ SIM_PARAMS = {
     'decays': 0.8,
     'sampling_state': 15,
     'noise_type': 'dpd',
-    'shared_coop_state': 2
+    'shared_coop_state': 2,
+    'device_id': 2
 }
 
 # Technical noise parameters
@@ -137,7 +138,8 @@ def run_simulation(
             noise_params=sim_params['noise_params'],
             decays=sim_params['decays'],
             sampling_state=sim_params['sampling_state'],
-            noise_type=sim_params['noise_type']
+            noise_type=sim_params['noise_type'],
+            device_id=sim_params.get('device_id', 0)
         )
         
         # 2. Build graph
@@ -230,13 +232,13 @@ def main():
         # Get unique list
         TARGET_GENES_TO_KNOCKDOWN = sorted(list(set(TARGET_GENES_TO_KNOCKDOWN)))
         
-        TARGET_GENES_TO_KNOCKDOWN = [g for g in TARGET_GENES_TO_KNOCKDOWN if g >= 73]
+        TARGET_GENES_TO_KNOCKDOWN = [g for g in TARGET_GENES_TO_KNOCKDOWN if g >= 143]
         
         if not TARGET_GENES_TO_KNOCKDOWN:
-            print(f"Error: No target genes >= 73 found in {INPUT_TARGETS_FILE}.")
+            print(f"Error: No target genes >= 143 found in {INPUT_TARGETS_FILE}.")
             sys.exit(1)
             
-        print(f"Found {len(TARGET_GENES_TO_KNOCKDOWN)} target genes (ID 73+) to intervene on.")
+        print(f"Found {len(TARGET_GENES_TO_KNOCKDOWN)} target genes (ID 143+) to intervene on.")
     
     except Exception as e:
         print(f"Error reading target gene file: {e}")
